@@ -1,86 +1,132 @@
 import streamlit as st
+import json
 import anthropic
-from typing import List
+from typing import Dict, Any
+import time
 
-# Initialize the page configuration
-st.set_page_config(page_title="Chat with Claude", layout="wide")
-
-# Initialize session state for message history if it doesn't exist
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-
-def initialize_client():
-    """Initialize the Anthropic client with API key."""
-    if 'api_key' not in st.session_state:
-        st.session_state.api_key = None
-        st.session_state.client = None
-
-def create_client(api_key: str):
-    """Create Anthropic client with the provided API key."""
-    try:
-        st.session_state.client = anthropic.Anthropic(api_key=api_key)
-        st.session_state.api_key = api_key
-        return True
-    except Exception as e:
-        st.error(f"Error initializing client: {str(e)}")
-        return False
-
-def get_claude_response(messages: List[dict]) -> str:
-    """Get a response from Claude using the messages API."""
-    try:
-        response = st.session_state.client.messages.create(
-            model="claude-3-sonnet-20240229",
-            max_tokens=1024,
-            messages=messages
+class WorkflowManager:
+    def __init__(self, api_key: str):
+        self.client = anthropic.Client(api_key=api_key)
+        self.current_workflow = None
+        
+    def process_workflow(self, workflow_data: Dict[Any, Any], prompt: str) -> str:
+        # Combine the workflow data and user prompt for Claude
+        system_prompt = """You are an expert at analyzing industrial workflows. 
+        Examine the provided workflow data and respond to the user's request.
+        Always provide specific references to the workflow data in your response."""
+        
+        messages = [
+            {
+                "role": "user",
+                "content": f"Here is the workflow data:\n{json.dumps(workflow_data, indent=2)}\n\nUser request: {prompt}"
+            }
+        ]
+        
+        response = self.client.messages.create(
+            model="claude-3-opus-20240229",
+            system=system_prompt,
+            messages=messages,
+            max_tokens=1000,
+            temperature=0
         )
+        
         return response.content[0].text
-    except Exception as e:
-        st.error(f"Error getting response: {str(e)}")
-        return None
+    
+    def modify_workflow(self, workflow_data: Dict[Any, Any], modification_prompt: str) -> Dict[Any, Any]:
+        system_prompt = """You are an expert at modifying industrial workflows.
+        When asked to modify a workflow, return ONLY the modified JSON workflow with no additional explanation.
+        Ensure the modified workflow maintains the same structure and format as the original."""
+        
+        messages = [
+            {
+                "role": "user",
+                "content": f"Here is the current workflow:\n{json.dumps(workflow_data, indent=2)}\n\nModification request: {modification_prompt}"
+            }
+        ]
+        
+        response = self.client.messages.create(
+            model="claude-3-opus-20240229",
+            system=system_prompt,
+            messages=messages,
+            max_tokens=1000,
+            temperature=0
+        )
+        
+        try:
+            return json.loads(response.content[0].text)
+        except json.JSONDecodeError:
+            st.error("Failed to parse modified workflow. Please try again with a different prompt.")
+            return workflow_data
 
-# Initialize the Anthropic client
-initialize_client()
+def main():
+    st.set_page_config(page_title="Industrial Workflow Analyzer", layout="wide")
+    st.title("Industrial Workflow Analyzer")
+    
+    # Initialize session state
+    if 'workflow_manager' not in st.session_state:
+        api_key = st.secrets.get("ANTHROPIC_API_KEY", None)
+        if api_key is None:
+            api_key = st.text_input("Enter your Anthropic API key:", type="password")
+            if not api_key:
+                st.warning("Please enter an API key to continue.")
+                return
+        st.session_state.workflow_manager = WorkflowManager(api_key)
+    
+    if 'current_workflow' not in st.session_state:
+        st.session_state.current_workflow = None
+    
+    # File upload section
+    st.header("Upload Workflow")
+    uploaded_file = st.file_uploader("Choose a JSON workflow file", type=['json'])
+    
+    if uploaded_file is not None:
+        try:
+            st.session_state.current_workflow = json.load(uploaded_file)
+            st.success("Workflow loaded successfully!")
+        except json.JSONDecodeError:
+            st.error("Invalid JSON file. Please upload a valid JSON workflow.")
+    
+    # Display current workflow
+    if st.session_state.current_workflow:
+        st.header("Current Workflow")
+        with st.expander("View Raw JSON"):
+            st.json(st.session_state.current_workflow)
+        
+        # Analysis section
+        st.header("Analyze Workflow")
+        analysis_prompt = st.text_area("Enter your analysis request:", 
+            placeholder="Example: Summarize the main steps of this workflow")
+        
+        if st.button("Analyze"):
+            with st.spinner("Analyzing workflow..."):
+                analysis_result = st.session_state.workflow_manager.process_workflow(
+                    st.session_state.current_workflow, 
+                    analysis_prompt
+                )
+                st.markdown("### Analysis Result")
+                st.write(analysis_result)
+        
+        # Modification section
+        st.header("Modify Workflow")
+        modification_prompt = st.text_area("Enter your modification request:",
+            placeholder="Example: Add a quality control step after step 2")
+        
+        if st.button("Modify"):
+            with st.spinner("Modifying workflow..."):
+                modified_workflow = st.session_state.workflow_manager.modify_workflow(
+                    st.session_state.current_workflow,
+                    modification_prompt
+                )
+                
+                # Show difference
+                st.markdown("### Modified Workflow")
+                with st.expander("View Modified JSON"):
+                    st.json(modified_workflow)
+                
+                if st.button("Accept Changes"):
+                    st.session_state.current_workflow = modified_workflow
+                    st.success("Workflow updated successfully!")
+                    st.rerun()
 
-# Main app layout
-st.title("💬 Chat with Claude")
-
-# API key input section
-with st.sidebar:
-    st.header("Configuration")
-    api_key = st.text_input("Enter your Anthropic API key", type="password")
-    if api_key and api_key != st.session_state.api_key:
-        if create_client(api_key):
-            st.success("API key configured successfully!")
-
-# Display message history
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.write(message["content"])
-
-# Chat input
-if prompt := st.chat_input("What would you like to ask Claude?"):
-    if not st.session_state.client:
-        st.error("Please configure your API key first!")
-    else:
-        # Add user message to state and display
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.write(prompt)
-
-        # Get Claude's response
-        with st.chat_message("assistant"):
-            message_placeholder = st.empty()
-            messages_for_claude = [
-                {"role": m["role"], "content": m["content"]} 
-                for m in st.session_state.messages
-            ]
-            response = get_claude_response(messages_for_claude)
-            
-            if response:
-                message_placeholder.write(response)
-                st.session_state.messages.append({"role": "assistant", "content": response})
-
-# Add a button to clear chat history
-if st.sidebar.button("Clear Chat History"):
-    st.session_state.messages = []
-    st.rerun()
+if __name__ == "__main__":
+    main()
